@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spring Winder</title>
+<style>
+  /* ---- tokens ---- */
+  :root {
+    --bg:        #0f0f0f;
+    --surface:   #181818;
+    --border:    #2a2a2a;
+    --border-hi: #3d3d3d;
+    --text:      #e8e8e8;
+    --muted:     #888;
+    --accent:    #c8a96e;   /* warm brass — references the mandrel material */
+    --accent-lo: #c8a96e22;
+    --green:     #4caf82;
+    --red:       #e05c5c;
+    --yellow:    #d4a843;
+    --radius:    6px;
+    --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ---- header ---- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    z-index: 10;
+  }
+  .wordmark {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .wordmark span { color: var(--muted); }
+
+  /* ---- connection bar ---- */
+  .conn-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .conn-bar input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 5px 10px;
+    width: 200px;
+    outline: none;
+    transition: border-color .15s;
+  }
+  .conn-bar input:focus { border-color: var(--accent); }
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--border-hi);
+    flex-shrink: 0;
+    transition: background .3s;
+  }
+  .status-dot.connected    { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.connecting   { background: var(--yellow); }
+  .status-dot.disconnected { background: var(--red); }
+  .conn-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 80px;
+  }
+
+  /* ---- layout ---- */
+  .main {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    grid-template-rows: auto auto;
+    gap: 1px;
+    background: var(--border);
+    min-height: calc(100vh - 53px);
+  }
+  .panel {
+    background: var(--bg);
+    padding: 20px;
+    overflow: auto;
+  }
+  .panel-title {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 18px;
+  }
+
+  /* ---- form ---- */
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .field input, .field select {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    padding: 7px 10px;
+    outline: none;
+    transition: border-color .15s;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+
+  .section-divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 18px 0;
+  }
+  .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-bottom: 12px;
+    margin-top: 18px;
+  }
+
+  /* ---- derived field (read-only, shows calculated value) ---- */
+  .derived {
+    background: var(--surface) !important;
+    color: var(--accent) !important;
+    font-family: var(--mono) !important;
+    cursor: default;
+  }
+
+  /* ---- right column: results + toolpath + control ---- */
+  .right-col {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border);
+  }
+
+  /* ---- results grid ---- */
+  .results-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+  }
+  .result-card .label {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .result-card .value {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 500;
+    color: var(--text);
+  }
+  .result-card .sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+  .result-card.highlight { border-color: var(--accent); }
+  .result-card.highlight .value { color: var(--accent); }
+
+  /* ---- warn ---- */
+  .warn {
+    font-size: 12px;
+    color: var(--yellow);
+    min-height: 18px;
+    margin-top: 6px;
+  }
+
+  /* ---- toolpath preview ---- */
+  .toolpath-pre {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    color: var(--text);
+    white-space: pre;
+    overflow: auto;
+    flex: 1;
+    line-height: 1.7;
+    min-height: 120px;
+  }
+  .key   { color: var(--muted); }
+  .num   { color: var(--accent); }
+  .str   { color: var(--green); }
+
+  /* ---- control panel ---- */
+  .control-panel {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  /* ---- buttons ---- */
+  .btn {
+    padding: 8px 18px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    font-size: 13px;
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: opacity .15s, background .15s;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--accent);
+    color: #0f0f0f;
+    font-weight: 600;
+  }
+  .btn-primary:hover:not(:disabled) { opacity: 0.85; }
+  .btn-ghost {
+    background: transparent;
+    border-color: var(--border-hi);
+    color: var(--text);
+  }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn-danger {
+    background: transparent;
+    border-color: var(--red);
+    color: var(--red);
+  }
+  .btn-danger:hover:not(:disabled) { background: var(--red); color: #fff; }
+
+  /* ---- progress ---- */
+  .progress-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 180px;
+  }
+  .progress-track {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    width: 0%;
+    transition: width .3s;
+  }
+  .progress-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  /* ---- status terminal ---- */
+  .terminal {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    height: 110px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 1px;
+    margin-top: 14px;
+  }
+  .term-line {
+    display: flex;
+    gap: 8px;
+    line-height: 1.6;
+    white-space: pre;
+  }
+  .term-ts  { color: #444; flex-shrink: 0; }
+  .term-key { color: var(--muted); }
+  .term-val { color: var(--accent); }
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius);
+    padding: 10px 16px;
+    font-size: 13px;
+    font-family: var(--mono);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity .2s, transform .2s;
+    pointer-events: none;
+    max-width: 300px;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.ok   { border-color: var(--green); color: var(--green); }
+  #toast.err  { border-color: var(--red);   color: var(--red); }
+  #length-anchor { width: auto;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">Spring<span>/</span>Winder</div>
+  <div class="conn-bar">
+    <div class="status-dot" id="dot"></div>
+    <div class="conn-label" id="conn-label">disconnected</div>
+    <input id="esp-url" type="text" value="springwinder.local" placeholder="springwinder.local">
+    <button class="btn btn-ghost" id="btn-connect" onclick="toggleConnect()">Connect</button>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- LEFT: spring designer -->
+  <div class="panel" style="grid-row: 1 / 3;">
+    <div class="panel-title">Spring designer</div>
+
+    <div class="section-label">Material &amp; wire</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Wire diameter (mm)</label>
+        <input id="d" type="number" min="0.1" max="3" step="0.01" value="0.6" oninput="calc()" onchange="calc()">
+      </div>
+      <div class="field">
+        <label>Target inner diameter (mm)</label>
+        <input id="id_" type="number" min="1" max="30" step="0.1" value="4.0" oninput="calc()" onchange="calc()">
+      </div>
+    </div>
+    <div class="field">
+      <label>Material</label>
+      <select id="mat" onchange="calc()">
+        <option value="79300">Music wire (steel), G = 79.3 GPa</option>
+        <option value="69000">Stainless 302/304, G = 69 GPa</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Mandrel springback allowance (mm)</label>
+      <input id="sb" type="number" min="0" max="2" step="0.05" value="0" oninput="calc()" onchange="calc()">
+    </div>
+
+    <hr class="section-divider">
+    <div class="section-label">Closed end winds</div>
+    <div class="field-row">
+      <div class="field">
+        <label>Start winds (turns)</label>
+        <input id="start-winds" type="number" min="0" max="20" step="0.5" value="3" oninput="calc()" onchange="calc()">
+      </div>
+      <div class="field">
+        <label>End winds (turns)</label>
+        <input id="end-winds" type="number" min="0" max="20" step="0.5" value="3" oninput="calc()" onchange="calc()">
+      </div>
+    </div>
+
+    <hr class="section-divider">
+    <div class="section-label">Active coils</div>
+    <div id="active-segments"></div>
+    <button class="btn btn-ghost" type="button" onclick="addActiveSegment()" style="margin-top:10px;">+ Add segment</button>
+    <div class="field">
+      <label>Active length (mm)</label>
+      <input id="length" type="number" readonly value="22.5"
+             style="width:100%; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); color:var(--text); font-size:13px; padding:7px 10px; outline:none; transition:border-color .15s;">
+    </div>
+
+    <hr class="section-divider">
+    <div class="section-label">Job settings</div>
+    <div class="field">
+      <label>Spindle speed (RPM)</label>
+      <input id="rpm" type="number" min="1" max="100" step="1" value="45" oninput="calc()" onchange="calc()">
+    </div>
+
+  </div>
+
+  <!-- RIGHT TOP: results -->
+  <div class="panel">
+    <div class="panel-title">Spring properties</div>
+    <div class="results-grid">
+      <div class="result-card highlight">
+        <div class="label">Spring rate</div>
+        <div class="value" id="r-rate">—</div>
+        <div class="sub" id="r-rate-lb">—</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Mean coil dia.</div>
+        <div class="value" id="r-D">—</div>
+        <div class="sub">mm</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Outer diameter</div>
+        <div class="value" id="r-OD">—</div>
+        <div class="sub">mm</div>
+      </div>
+      <div class="result-card highlight">
+        <div class="label">Suggested mandrel</div>
+        <div class="value" id="r-mand">—</div>
+        <div class="sub">mm (before springback)</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Free length</div>
+        <div class="value" id="r-fl">—</div>
+        <div class="sub">mm (active)</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Total length</div>
+        <div class="value" id="r-tl">—</div>
+        <div class="sub">mm incl. end coils</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Solid height</div>
+        <div class="value" id="r-solid">—</div>
+        <div class="sub">mm</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Max travel</div>
+        <div class="value" id="r-travel">—</div>
+        <div class="sub">mm</div>
+      </div>
+      <div class="result-card">
+        <div class="label">Spring index</div>
+        <div class="value" id="r-C">—</div>
+        <div class="sub">D / d</div>
+      </div>
+    </div>
+    <div class="warn" id="warn"></div>
+
+    <hr class="section-divider">
+    <div class="panel-title" style="margin-top:4px;">Toolpath</div>
+    <div class="toolpath-pre" id="toolpath-pre"></div>
+  </div>
+
+  <!-- RIGHT BOTTOM: machine control -->
+  <div class="panel">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:18px;">
+      <div class="panel-title" style="margin-bottom:0;">Machine control</div>
+      <span id="term-status" style="font-family:var(--mono); font-size:10px; color:var(--muted);">no messages</span>
+    </div>
+    <div class="control-panel">
+      <button class="btn btn-primary" id="btn-send"   onclick="sendJob()"    disabled>Send job</button>
+      <button class="btn btn-ghost"   id="btn-play"   onclick="send('RUN')"  disabled>▶ Play</button>
+      <button class="btn btn-ghost"   id="btn-pause"  onclick="send('PAUSE')" disabled>⏸ Pause</button>
+      <button class="btn btn-danger"  id="btn-stop"   onclick="send('STOP')" disabled>■ Stop</button>
+      <button class="btn btn-ghost"   id="btn-home"   onclick="send('HOME')" disabled>⌂ Home</button>
+
+      <div class="progress-wrap">
+        <div class="progress-track"><div class="progress-fill" id="prog-fill"></div></div>
+        <div class="progress-label" id="prog-label">—</div>
+      </div>
+    </div>
+
+    <hr class="section-divider" style="margin-top:16px;">
+    <div class="section-label" style="margin-top:0;">Jog</div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-ghost" id="btn-jog-sf" onmousedown="send('JOG_SPINDLE_FWD_START')" onmouseup="send('JOG_STOP')" ontouchstart="send('JOG_SPINDLE_FWD_START')" ontouchend="send('JOG_STOP')" disabled>Spindle fwd ▶</button>
+      <button class="btn btn-ghost" id="btn-jog-sr" onmousedown="send('JOG_SPINDLE_REV_START')" onmouseup="send('JOG_STOP')" ontouchstart="send('JOG_SPINDLE_REV_START')" ontouchend="send('JOG_STOP')" disabled>◀ Spindle rev</button>
+      <button class="btn btn-ghost" id="btn-jog-cl" onmousedown="send('JOG_CARRIAGE_LEFT_START')" onmouseup="send('JOG_STOP')" ontouchstart="send('JOG_CARRIAGE_LEFT_START')" ontouchend="send('JOG_STOP')" disabled>◀ Carriage left</button>
+      <button class="btn btn-ghost" id="btn-jog-cr" onmousedown="send('JOG_CARRIAGE_RIGHT_START')" onmouseup="send('JOG_STOP')" ontouchstart="send('JOG_CARRIAGE_RIGHT_START')" ontouchend="send('JOG_STOP')" disabled>Carriage right ▶</button>
+    </div>
+
+    <div class="terminal" id="terminal"></div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ─── WebSocket ───────────────────────────────────────────────
+let ws = null;
+let machineState = { running: false, paused: false, segment: 0, segmentCount: 0, turnsElapsed: 0 };
+let activeSegments = [{ pitch: 1.5, turns: 15 }];
+let generatedPayload = null;
+
+// If served directly by the ESP32 (not file:// or localhost), use the current
+// host — page and API share the same origin, CORS never applies.
+const SELF_HOSTED = (window.location.protocol === 'http:' &&
+                     window.location.hostname !== 'localhost' &&
+                     window.location.hostname !== '127.0.0.1');
+
+function espBase() {
+  if (SELF_HOSTED) return window.location.origin;
+  const h = document.getElementById('esp-url').value.trim();
+  return h.startsWith('http') ? h.replace(/\/$/, '') : 'http://' + h;
+}
+function wsUrl() {
+  return espBase().replace(/^http/, 'ws') + '/ws';
+}
+
+function toggleConnect() {
+  if (ws && ws.readyState <= 1) { ws.close(); return; }
+  openWs();
+}
+
+function openWs() {
+  setConnLabel('connecting', 'connecting…');
+  ws = new WebSocket(wsUrl());
+
+  ws.onopen = () => {
+    setConnLabel('connected', 'connected');
+    document.getElementById('btn-connect').textContent = 'Disconnect';
+    enableControls(true);
+  };
+
+  ws.onmessage = e => {
+    try {
+      const s = JSON.parse(e.data);
+      if (s.type === 'ack') {
+        toast(s.status === 'ok' ? 'Job uploaded' : 'Upload failed: ' + s.msg,
+              s.status === 'ok' ? 'ok' : 'err');
+        return;
+      }
+      machineState = { ...machineState, ...s };
+      updateMachineUI();
+      termPush(s);
+    } catch(_) {}
+  };
+
+  ws.onclose = () => {
+    setConnLabel('disconnected', 'disconnected');
+    document.getElementById('btn-connect').textContent = 'Connect';
+    enableControls(false);
+    ws = null;
+  };
+
+  ws.onerror = () => {
+    toast('Could not reach ' + wsUrl(), 'err');
+  };
+}
+
+function send(msg) {
+  if (ws && ws.readyState === 1) ws.send(msg);
+}
+
+function setConnLabel(cls, text) {
+  const dot = document.getElementById('dot');
+  const lbl = document.getElementById('conn-label');
+  dot.className = 'status-dot ' + cls;
+  lbl.textContent = text;
+}
+
+function enableControls(on) {
+  ['btn-send','btn-play','btn-pause','btn-stop','btn-home',
+   'btn-jog-sf','btn-jog-sr','btn-jog-cl','btn-jog-cr'].forEach(id => {
+    document.getElementById(id).disabled = !on;
+  });
+}
+
+function updateMachineUI() {
+  const s = machineState;
+  const totalTurns = generatedPayload
+    ? generatedPayload.segments.reduce((a, seg) => a + seg.turns, 0)
+    : 0;
+  const pct = totalTurns > 0 ? Math.min(100, (s.turnsElapsed || 0) / totalTurns * 100) : 0;
+
+  document.getElementById('prog-fill').style.width = pct.toFixed(1) + '%';
+
+  let label = '—';
+  if (s.running && !s.paused) {
+    label = `seg ${s.segment + 1}/${s.segmentCount}  ·  ${(s.turnsElapsed || 0).toFixed(1)} turns`;
+  } else if (s.paused) {
+    label = 'paused';
+  } else if (s.segmentCount > 0) {
+    label = pct >= 99.5 ? 'complete' : 'ready';
+  }
+  document.getElementById('prog-label').textContent = label;
+}
+
+// ─── Spring calculations ──────────────────────────────────────
+// pitch and turns are the two free inputs.
+// length is a third input, but requires an "anchor" since length alone
+// is underdetermined — the anchor selector says which of pitch/turns to hold
+// fixed when the user types a new length.
+// When pitch or turns is edited, length always derives (pitch × turns).
+
+function onActiveSegmentInput(index, field) {
+  const el = document.getElementById(`seg-${field}-${index}`);
+  if (!el) return;
+  const value = parseFloat(el.value) || 0;
+  activeSegments[index][field] = value;
+  calc();
+}
+
+function addActiveSegment() {
+  activeSegments.push({ pitch: 1.5, turns: 10 });
+  renderActiveSegments();
+  calc();
+}
+
+function removeActiveSegment(index) {
+  if (activeSegments.length <= 1) return;
+  activeSegments.splice(index, 1);
+  renderActiveSegments();
+  calc();
+}
+
+function renderActiveSegments() {
+  const container = document.getElementById('active-segments');
+  if (!container) return;
+  container.innerHTML = activeSegments.map((seg, i) => {
+    const canRemove = activeSegments.length > 1;
+    return `
+      <div class="field-row" style="margin-bottom:8px; align-items:flex-end; gap:8px;">
+        <div class="field" style="flex:1; min-width:0;">
+          <label>Pitch (mm)</label>
+          <input id="seg-pitch-${i}" type="number" min="0.05" max="10" step="0.05" value="${seg.pitch}"
+                 oninput="onActiveSegmentInput(${i}, 'pitch')" onchange="onActiveSegmentInput(${i}, 'pitch')">
+        </div>
+        <div class="field" style="width:120px; min-width:0;">
+          <label>Turns</label>
+          <input id="seg-turns-${i}" type="number" min="1" max="200" step="0.5" value="${seg.turns}"
+                 oninput="onActiveSegmentInput(${i}, 'turns')" onchange="onActiveSegmentInput(${i}, 'turns')">
+        </div>
+        <button class="btn btn-ghost" type="button" onclick="removeActiveSegment(${i})" ${canRemove ? '' : 'disabled'} style="height:32px; margin-top:22px;">✕</button>
+      </div>
+    `;
+  }).join('');
+}
+
+function calc() {
+  // Read all values fresh from DOM every time
+  const d   = parseFloat(document.getElementById('d').value)    || 0;
+  const ID  = parseFloat(document.getElementById('id_').value)  || 0;
+  const sb  = parseFloat(document.getElementById('sb').value)   || 0;
+  const G   = parseFloat(document.getElementById('mat').value)  || 79300;
+  const sw  = parseFloat(document.getElementById('start-winds').value) || 0;
+  const ew  = parseFloat(document.getElementById('end-winds').value)   || 0;
+  const rpm = parseFloat(document.getElementById('rpm').value)  || 45;
+
+  activeSegments = activeSegments.map((seg, i) => {
+    const pitch = parseFloat(document.getElementById(`seg-pitch-${i}`).value) || 0;
+    const turns = parseFloat(document.getElementById(`seg-turns-${i}`).value) || 0;
+    return { pitch, turns };
+  });
+
+  const totalTurns = activeSegments.reduce((sum, seg) => sum + seg.turns, 0);
+  const totalLength = activeSegments.reduce((sum, seg) => sum + (seg.pitch * seg.turns), 0);
+
+  // ── Spring rate ────────────────────────────────────────────────
+  const D = ID + d;
+  const OD = ID + 2 * d;
+  const C = d > 0 ? D / d : 0;
+  const Na = totalTurns;
+  const k = (Na > 0 && D > 0) ? (G * Math.pow(d, 4)) / (8 * Math.pow(D, 3) * Na) : 0;
+  const klb = k * 5.7101;
+
+  const freeLen   = totalLength;
+  const solidAct  = (Na + 1) * d;
+  const endLen    = (sw + ew) * d;
+  const totalLen  = freeLen + endLen;
+  const solid     = solidAct + endLen;
+  const travel    = Math.max(freeLen - solidAct, 0);
+  const mandrel   = Math.max(ID - sb, 0.1);
+
+  // ── Update result cards ────────────────────────────────────────
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+  set('r-rate',    k > 0 ? k.toFixed(3) + ' N/mm' : '—');
+  set('r-rate-lb', k > 0 ? klb.toFixed(2) + ' lbf/in' : '');
+  set('r-D',       D.toFixed(2));
+  set('r-OD',      OD.toFixed(2));
+  set('r-mand',    mandrel.toFixed(2));
+  set('r-fl',      freeLen.toFixed(2));
+  set('r-tl',      totalLen.toFixed(2));
+  set('r-solid',   solid.toFixed(2));
+  set('r-travel',  travel.toFixed(2));
+  set('r-C',       C.toFixed(1));
+
+  // ── Warnings ──────────────────────────────────────────────────
+  let warn = '';
+  if (C > 0 && C < 4)  warn = 'Spring index below 4 — coiling will be tight.';
+  if (C > 14)           warn = 'Spring index above 14 — may buckle under load.';
+  if (activeSegments.some(seg => seg.pitch > 0 && d > 0 && seg.pitch < d))
+    warn += (warn ? '  ' : '') + 'Pitch < wire diameter — coils will overlap.';
+  document.getElementById('warn').textContent = warn;
+
+  document.getElementById('length').value = totalLength.toFixed(2);
+
+  // ── Toolpath payload ──────────────────────────────────────────
+  const segments = [];
+  if (sw > 0) segments.push({ pitch_mm: +d.toFixed(3), turns: sw });
+  activeSegments.forEach(seg => {
+    if (seg.turns > 0) segments.push({ pitch_mm: +seg.pitch.toFixed(3), turns: +seg.turns.toFixed(2) });
+  });
+  if (ew > 0) segments.push({ pitch_mm: +d.toFixed(3), turns: ew });
+
+  generatedPayload = { spindle_rpm: rpm, segments };
+  renderToolpath(generatedPayload);
+}
+
+// ─── Syntax-highlighted toolpath preview ─────────────────────
+function renderToolpath(payload) {
+  if (!payload) { document.getElementById('toolpath-pre').innerHTML = ''; return; }
+  let html = '<span class="key">{</span>\n';
+  html += `  <span class="key">"spindle_rpm"</span>: <span class="num">${payload.spindle_rpm}</span>,\n`;
+  html += `  <span class="key">"segments"</span>: [\n`;
+  payload.segments.forEach((seg, i) => {
+    const comma = i < payload.segments.length - 1 ? ',' : '';
+    html += `    <span class="key">{</span> `;
+    html += `<span class="key">"pitch_mm"</span>: <span class="num">${seg.pitch_mm}</span>, `;
+    html += `<span class="key">"turns"</span>: <span class="num">${seg.turns}</span> `;
+    html += `<span class="key">}</span>${comma}\n`;
+  });
+  html += `  <span class="key">]</span>\n<span class="key">}</span>`;
+  document.getElementById('toolpath-pre').innerHTML = html;
+}
+
+// ─── Job upload ───────────────────────────────────────────────
+async function sendJob() {
+  if (!generatedPayload || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify(generatedPayload));
+  // listen for ack in onmessage
+}
+
+// ─── Terminal ────────────────────────────────────────────────
+const MAX_TERM_LINES = 60;
+let termLines = [];
+
+function termPush(obj) {
+  const now = new Date();
+  const ts = now.toTimeString().slice(0, 8);
+
+  // Build a compact key:value line from the status object
+  const parts = Object.entries(obj).map(([k, v]) => {
+    if (typeof v === 'boolean') return `${k}:<span class="term-val">${v ? 'Y' : 'N'}</span>`;
+    if (typeof v === 'number')  return `${k}:<span class="term-val">${Number.isInteger(v) ? v : v.toFixed(2)}</span>`;
+    return `${k}:<span class="term-val">${v}</span>`;
+  }).join('  ');
+
+  termLines.unshift(`<div class="term-line"><span class="term-ts">${ts}</span><span class="term-key">${parts}</span></div>`);
+  if (termLines.length > MAX_TERM_LINES) termLines.length = MAX_TERM_LINES;
+
+  const el = document.getElementById('terminal');
+  if (el) el.innerHTML = termLines.join('');
+
+  // Update the subtitle with just the most recent state summary
+  const s = machineState;
+  const st = s.running ? (s.paused ? 'paused' : 'running') : 'idle';
+  document.getElementById('term-status').textContent =
+    `${st}  ·  seg ${s.segment}/${s.segmentCount}  ·  ${(s.turnsElapsed||0).toFixed(1)} turns`;
+}
+
+// ─── Toast ───────────────────────────────────────────────────
+let toastTimer = null;
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + (type || '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, 3500);
+}
+
+// ─── Init ────────────────────────────────────────────────────
+renderActiveSegments();
+calc();
+
+// When served from the ESP32 itself, hide the URL input (not needed) and
+// connect automatically so the page is ready to use on first load.
+if (SELF_HOSTED) {
+  document.getElementById('esp-url').style.display = 'none';
+  document.getElementById('btn-connect').style.display = 'none';
+  openWs();
+}
+</script>
+</body>
+</html>

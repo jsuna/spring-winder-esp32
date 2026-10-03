@@ -1,0 +1,516 @@
+// Spring winder firmware — single ESP32, open-loop dual stepper
+//
+// Libraries needed (Arduino Library Manager):
+//   ESPAsyncWebServer, AsyncTCP, ArduinoJson (v6 API used below)
+//
+// Architecture:
+//   - No encoders. Spindle speed is constant for the whole job, so position
+//     tracking is just elapsed_time x known_RPM — no per-tick polling loop.
+//   - Leadscrew step rate only changes at segment boundaries (when pitch changes).
+//   - Both axes are driven via the ESP32's LEDC hardware PWM peripheral, so once
+//     a rate is set, pulse generation costs ~zero ongoing CPU time.
+//   - The firmware only knows about generic {pitch, turns} segments. Turning
+//     "20mm long, 1.5mm pitch, 3 start/end winds" into that list is the web
+//     tool's job, not this firmware's.
+
+#include <Arduino.h>   // .ino files get this for free; .cpp files under PlatformIO don't
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+
+// ====================== PIN CONFIGURATION ======================
+// Adjust to match your wiring. Chosen to avoid ESP32 strapping pins and the
+// input-only pins (34-39), so every switch below can use INPUT_PULLUP —
+// just wire each switch to GND, no external resistors needed.
+
+#define SPINDLE_STEP_PIN       32
+#define SPINDLE_DIR_PIN        33
+#define LEADSCREW_STEP_PIN     26
+#define LEADSCREW_DIR_PIN      27
+#define SPINDLE_EN_PIN    25
+#define LEADSCREW_EN_PIN  14
+
+#define JOG_SPINDLE_FWD_PIN     18
+#define JOG_SPINDLE_REV_PIN    23
+#define JOG_CARRIAGE_LEFT_PIN  19
+#define JOG_CARRIAGE_RIGHT_PIN 4
+
+#define HOME_LIMIT_PIN         16   // defines carriage zero
+#define FAR_LIMIT_PIN          17   // optional safety cutoff; leave unwired if you don't have one — reads HIGH (untriggered) by default with the internal pull-up
+
+// ====================== MACHINE CONFIGURATION ======================
+// Adjust to your actual gearing/hardware. These mirror the gear-ratio
+// calculator we worked through earlier.
+
+#define MOTOR_STEPS_PER_REV     200    // 1.8 deg steppers
+#define MICROSTEPPING             8    // match your TMC2209 MS1/MS2 config
+#define SPINDLE_GEAR_RATIO      3.0    // motor revs per spindle-shaft rev
+#define LEADSCREW_GEAR_RATIO    1.227  // motor revs per leadscrew-shaft rev — current as-built gearing: 16T<->30T jackshaft, 46T<->20T leadscrew
+#define SCREW_LEAD_MM             1.0   // mm of carriage travel per leadscrew-shaft rev
+
+#define JOG_FREQ_HZ            1000.0   // step rate while jogging — tune to taste
+#define HOMING_FREQ_HZ         1000.0
+
+#define SPINDLE_CH     0
+#define LEADSCREW_CH   1
+
+#define MAX_SEGMENTS   32
+
+#define SPINDLE_CW LOW
+#define SPINDLE_CCW HIGH
+#define LEADSCREW_CW HIGH
+#define LEADSCREW_CCW LOW
+#define HOME_DIR LEADSCREW_CCW   // toward home switch
+#define FAR_DIR  LEADSCREW_CW   // toward far switch
+#define BACKOFF_MS 500 // length of time to back off after hitting the home/far switch, before stopping the leadscrew
+// ====================== WIFI / NETWORK ======================
+const char* WIFI_SSID = "Tipsytoes";
+const char* WIFI_PASS = "tipsy123!";
+const char* MDNS_NAME = "springwinder";   // reachable at springwinder.local
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// ====================== TOOLPATH ======================
+struct Segment { float pitch_mm; float turns; };
+Segment segments[MAX_SEGMENTS];
+int segmentCount = 0;
+
+float spindleRPM = 45.0;   // constant target spindle speed for the job, sent with the job upload
+
+int currentSegment = 0;
+unsigned long jobStartMillis = 0;
+float cumulativeTurnsAtSegmentStart = 0;
+unsigned long pausedAtMillis = 0;
+
+unsigned long homeBackoffStart = 0;
+bool farLimitTriggered = false;
+
+enum SwitchDirs { FWD, REV, LEFT, RIGHT };
+// state
+enum MachineState { RUNNING, PAUSED, HOMING, IDLE, JOGGING, BACKING_OFF };
+
+enum MachineActions { 
+  START_JOB, 
+  PAUSE_JOB, 
+  RESUME_JOB, 
+  STOP_JOB, 
+  JOG_SPINDLE, 
+  JOG_CARRIAGE,
+  START_HOMING, 
+  UPDATE_JOB,
+  HANDLE_JOG_SWITCHES
+};
+
+MachineActions machineAction;
+MachineState machineState = IDLE;
+
+bool state(MachineState queryState) {
+  //Serial.printf("state: %d : %d\n", machineState, queryState);
+  return machineState == queryState;
+}
+
+bool homeLimitHit() {
+  return digitalRead(HOME_LIMIT_PIN) == LOW;
+}
+
+bool farLimitHit() {
+  return digitalRead(FAR_LIMIT_PIN) == LOW;
+}
+
+bool canRun(MachineActions action) {
+  bool canRun = true;
+  switch (action) {
+    case START_JOB:
+    case JOG_SPINDLE:
+    case JOG_CARRIAGE:
+    case START_HOMING:
+      if (
+        !state(IDLE)
+    ) canRun = false;
+      break;
+    case PAUSE_JOB:
+      if (
+        !state(RUNNING)
+      ) canRun = false;
+      break;
+    case RESUME_JOB:
+      if (
+        !state(PAUSED)    
+      ) canRun = false;
+      break;
+  
+    case UPDATE_JOB:
+      if (
+        machineState != RUNNING || 
+        machineState == PAUSED
+      ) canRun = false;
+      break;
+    case HANDLE_JOG_SWITCHES:
+      if (
+        !state(IDLE) && 
+        !state(JOGGING)
+      ) canRun = false;
+      break;
+  }
+  
+  return canRun;
+}
+
+void setAxisRate(int channel, double freqHz) {
+  //Serial.printf("setAxisRate ch=%d freq=%.1f\n", channel, freqHz);
+  if (freqHz <= 0) {
+    ledcWrite(channel, 0);  // force duty to 0 — actually stops pulses
+  } else {
+    ledcWriteTone(channel, freqHz);
+  }
+}
+
+// ====================== JOG ======================
+void jogStop() {
+  setAxisRate(SPINDLE_CH, 0);
+  setAxisRate(LEADSCREW_CH, 0);
+  machineState = IDLE;
+  //Serial.printf("jogStop: %d\n", machineState);
+}
+
+void jogSpindle(bool forward) {
+  if (!canRun(JOG_SPINDLE)) return;
+  digitalWrite(SPINDLE_DIR_PIN, forward ? SPINDLE_CW : SPINDLE_CCW);
+  setAxisRate(SPINDLE_CH, JOG_FREQ_HZ);
+  machineState = JOGGING;
+  Serial.printf("jogSpindle: %s at %.1f Hz : %d\n", forward ? "forward" : "reverse", JOG_FREQ_HZ, machineState);
+}
+
+void jogCarriage(bool rightward) {
+  if (!canRun(JOG_CARRIAGE)) return;
+  digitalWrite(LEADSCREW_DIR_PIN, rightward ? LEADSCREW_CW : LEADSCREW_CCW);
+  setAxisRate(LEADSCREW_CH, JOG_FREQ_HZ);
+  machineState = JOGGING;
+  Serial.printf("jogCarriage: %s at %.1f Hz : %d\n", rightward ? "rightward" : "leftward", JOG_FREQ_HZ, machineState);
+}
+
+void handleJogSwitches() {
+  if (!canRun(HANDLE_JOG_SWITCHES)) return;
+  int swPins[4] = {
+    digitalRead(JOG_SPINDLE_FWD_PIN),
+    digitalRead(JOG_SPINDLE_REV_PIN),
+    digitalRead(JOG_CARRIAGE_LEFT_PIN),
+    digitalRead(JOG_CARRIAGE_RIGHT_PIN)
+  };
+  int switchStates[4] = {
+    digitalRead(JOG_SPINDLE_FWD_PIN) == LOW ? 1 : 0,
+    digitalRead(JOG_SPINDLE_REV_PIN) == LOW ? 1 : 0,
+    digitalRead(JOG_CARRIAGE_LEFT_PIN) == LOW ? 1 : 0,
+    digitalRead(JOG_CARRIAGE_RIGHT_PIN) == LOW ? 1 : 0
+  };
+  
+  SwitchDirs switchIndexes[4] = {FWD, REV, LEFT, RIGHT};
+  int pressedSum = 0;
+  int pressedIndx = -1;
+  for (int i = 0; i < 4; i++) {
+    pressedSum += switchStates[i];
+    if (switchStates[i] == 1) {
+      pressedIndx = i;
+    }
+  }
+  
+  //Serial.printf("switchStates: %d %d %d %d\n", swPins[0], swPins[1], swPins[2], swPins[3]);
+  SwitchDirs switchDir;
+  if (pressedIndx >= 0) {
+    switchDir = switchIndexes[pressedIndx];
+  }
+  if (
+    !switchDir ||  // no buttons pressed or 
+    pressedSum > 1 || 
+    pressedSum <= 0 ||
+    switchDir == RIGHT && farLimitTriggered
+  ) {
+    jogStop();
+    return;  // ignore if multiple switches pressed at once or no buttons pressed
+  }
+  
+  if (state(JOGGING)) return;
+  switch (switchDir) {
+    case FWD:
+      jogSpindle(true);
+      break;
+    case REV:
+      jogSpindle(false);
+      break;
+    case LEFT :
+      jogCarriage(false);
+      break;
+    case RIGHT:
+      jogCarriage(true);
+      break;
+    default:
+      jogStop();
+      break;
+  }
+}
+
+void startHoming() {
+  Serial.println("startHoming called");
+  if (!canRun(START_HOMING)) return;
+  digitalWrite(LEADSCREW_DIR_PIN, HOME_DIR);   // toward home switch — flip if it homes the wrong way
+  setAxisRate(LEADSCREW_CH, HOMING_FREQ_HZ);
+  machineState = HOMING;
+  Serial.printf("homing: seeking home limit — %s at %.1f Hz\n", HOME_DIR == LEADSCREW_CCW ? "CCW" : "CW", HOMING_FREQ_HZ);
+}
+
+void updateHoming() {
+  bool isHoming = state(HOMING);
+  if (isHoming && farLimitTriggered) {
+    // reset the trigger flag once the carriage clears the switch
+    if (!farLimitHit()) farLimitTriggered = false;  
+  }
+  if (isHoming && homeLimitHit()) {
+    digitalWrite(LEADSCREW_DIR_PIN, FAR_DIR);  // back off the other way
+    setAxisRate(LEADSCREW_CH, HOMING_FREQ_HZ / 2);
+    machineState = BACKING_OFF;
+    homeBackoffStart = millis();
+  }
+  if (state(BACKING_OFF) && millis() - homeBackoffStart > BACKOFF_MS) {
+    setAxisRate(LEADSCREW_CH, 0);
+    machineState = IDLE;
+    Serial.printf("homing: backoff complete — %d\n", machineState);
+    // current position is now carriage zero
+  }
+}
+
+// ====================== RUN EXECUTOR ======================
+void applyLeadscrewRateForSegment(int segIdx) {
+  float pitch = segments[segIdx].pitch_mm;
+  double leadscrewOutputRPM = spindleRPM * (pitch / SCREW_LEAD_MM);
+  double leadscrewMotorFreq = (leadscrewOutputRPM / 60.0) * LEADSCREW_GEAR_RATIO
+                              * MOTOR_STEPS_PER_REV * MICROSTEPPING;
+  
+  digitalWrite(LEADSCREW_DIR_PIN, FAR_DIR);   // carriage advances one direction for the whole job
+  setAxisRate(LEADSCREW_CH, leadscrewMotorFreq);
+
+  Serial.printf("applyLeadscrewRateForSegment seg=%d pitch=%.3f leadscrewMotorFreq=%.1f\n",
+                segIdx, pitch, leadscrewMotorFreq);
+}
+
+void startJob() {
+  if (!canRun(START_JOB)) return;
+  ledcSetup(SPINDLE_CH,   1, 10);
+  ledcSetup(LEADSCREW_CH, 1, 10);
+  Serial.println("starting job");
+  if (segmentCount == 0 || state(RUNNING) || farLimitTriggered) return;
+  currentSegment = 0;
+  cumulativeTurnsAtSegmentStart = 0;
+  jobStartMillis = millis();
+  machineState = RUNNING;
+
+  double spindleMotorFreq = (spindleRPM / 60.0) * SPINDLE_GEAR_RATIO
+                            * MOTOR_STEPS_PER_REV * MICROSTEPPING;
+  
+  Serial.printf("spindleRPM=%.1f\n", spindleRPM);
+  Serial.printf("spindleMotorFreq=%.1f\n", spindleMotorFreq);
+  Serial.printf("leadscrewMotorFreq=%.1f\n", (spindleRPM * (segments[0].pitch_mm / SCREW_LEAD_MM) / 60.0) * LEADSCREW_GEAR_RATIO * MOTOR_STEPS_PER_REV * MICROSTEPPING);
+  Serial.printf("segmentCount=%d\n", segmentCount);
+  Serial.printf("machineState: %d\n", machineState);
+  
+  digitalWrite(SPINDLE_DIR_PIN, SPINDLE_CW);
+  setAxisRate(SPINDLE_CH, spindleMotorFreq);
+
+  applyLeadscrewRateForSegment(0);
+}
+
+void pauseJob() {
+  if (!canRun(PAUSE_JOB)) return;
+  machineState = PAUSED;
+  pausedAtMillis = millis();
+  setAxisRate(SPINDLE_CH, 0);
+  setAxisRate(LEADSCREW_CH, 0);
+  Serial.printf("job paused: %d\n", machineState);
+}
+
+void resumeJob() {
+  if (!canRun(RESUME_JOB)) return;
+  jobStartMillis += millis() - pausedAtMillis;  // shift the clock so elapsed-time math stays correct
+  machineState = RUNNING;
+
+  double spindleMotorFreq = (spindleRPM / 60.0) * SPINDLE_GEAR_RATIO
+                            * MOTOR_STEPS_PER_REV * MICROSTEPPING;
+  setAxisRate(SPINDLE_CH, spindleMotorFreq);
+  applyLeadscrewRateForSegment(currentSegment);
+  Serial.printf("job resumed: %d\n", machineState);
+}
+
+void stopJob() {
+  if (!canRun(STOP_JOB)) return;
+  machineState = IDLE;
+  setAxisRate(SPINDLE_CH, 0);
+  setAxisRate(LEADSCREW_CH, 0);
+  Serial.printf("Job Stopped: %d\n", machineState);
+}
+
+void updateJob() {
+  if (!canRun(UPDATE_JOB)) return;
+
+  if (farLimitHit() && !farLimitTriggered) {   // safety cutoff if wired
+    Serial.println("stopJob: far limit triggered");
+    farLimitTriggered = true;
+    stopJob();
+    return;
+  }
+
+  float elapsedSec = (millis() - jobStartMillis) / 1000.0;
+  float totalTurnsElapsed = elapsedSec * (spindleRPM / 60.0);
+  float turnsIntoSegment = totalTurnsElapsed - cumulativeTurnsAtSegmentStart;
+
+  if (turnsIntoSegment >= segments[currentSegment].turns) {
+    cumulativeTurnsAtSegmentStart += segments[currentSegment].turns;
+    currentSegment++;
+    if (currentSegment >= segmentCount) {
+      stopJob();
+      return;
+    }
+    applyLeadscrewRateForSegment(currentSegment);
+  }
+}
+
+// ====================== WEBSOCKET: control plane ======================
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  
+  if (type == WS_EVT_CONNECT) {
+      Serial.printf("Client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+  }
+  if (type != WS_EVT_DATA) return;
+  String msg = String((char*)data).substring(0, len);
+  Serial.println("ws msg: " + msg);
+  
+  if (msg.startsWith("{")) {
+    // JSON payload — parse as job upload
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, msg)) {
+      client->text("{\"type\":\"ack\",\"status\":\"error\",\"msg\":\"bad json\"}");
+      return;
+    }
+    if (state(RUNNING) || state(PAUSED)) {
+      client->text("{\"type\":\"ack\",\"status\":\"error\",\"msg\":\"job running\"}");
+      return;
+    }
+    if (doc.containsKey("spindle_rpm")) spindleRPM = doc["spindle_rpm"];
+    segmentCount = 0;
+    for (JsonObject s : doc["segments"].as<JsonArray>()) {
+      if (segmentCount >= MAX_SEGMENTS) break;
+      segments[segmentCount].pitch_mm = s["pitch_mm"];
+      segments[segmentCount].turns    = s["turns"];
+      segmentCount++;
+    }
+    client->text("{\"type\":\"ack\",\"status\":\"ok\"}");
+    return;
+  }
+
+  if (msg == "JOG_SPINDLE_FWD_START") jogSpindle(true);
+  else if (msg == "JOG_SPINDLE_REV_START") jogSpindle(false);
+  else if (msg == "JOG_CARRIAGE_LEFT_START") jogCarriage(false);
+  else if (msg == "JOG_CARRIAGE_RIGHT_START") jogCarriage(true);
+  else if (msg == "JOG_STOP") jogStop();
+  else if (msg == "HOME") startHoming();
+  else if (msg == "RUN") startJob();
+  else if (msg == "PAUSE") pauseJob();
+  else if (msg == "RESUME") resumeJob();
+  else if (msg == "STOP") stopJob();
+}
+
+unsigned long lastStatusMillis = 0;
+void broadcastStatus() {
+  if (millis() - lastStatusMillis < 200) return;
+  lastStatusMillis = millis();
+
+  StaticJsonDocument<256> doc;
+  doc["running"] = state(RUNNING);
+  doc["paused"] = state(PAUSED);
+  doc["segment"] = currentSegment;
+  doc["segmentCount"] = segmentCount;
+  if (state(RUNNING) && !state(PAUSED)) {
+    float elapsedSec = (millis() - jobStartMillis) / 1000.0;
+    doc["turnsElapsed"] = elapsedSec * (spindleRPM / 60.0);
+  }
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+}
+
+void logPins() {
+  Serial.printf("FWD_PIN: %d ", digitalRead(JOG_SPINDLE_FWD_PIN));
+  Serial.printf("REV_PIN: %d ", digitalRead(JOG_SPINDLE_REV_PIN));
+  Serial.printf("LEFT_PIN: %d ", digitalRead(JOG_CARRIAGE_LEFT_PIN));
+  Serial.printf("RIGHT_PIN: %d ", digitalRead(JOG_CARRIAGE_RIGHT_PIN));
+  Serial.printf("HLMT_PIN: %d ", digitalRead(HOME_LIMIT_PIN));
+  Serial.printf("FLMT_PIN: %d\n", digitalRead(FAR_LIMIT_PIN));
+}
+// ====================== SETUP / LOOP ======================
+void setupJogPins() {
+  pinMode(JOG_SPINDLE_FWD_PIN, INPUT_PULLUP);
+  pinMode(JOG_SPINDLE_REV_PIN, INPUT_PULLUP);
+  pinMode(JOG_CARRIAGE_LEFT_PIN, INPUT_PULLUP);
+  pinMode(JOG_CARRIAGE_RIGHT_PIN, INPUT_PULLUP);
+}
+
+void setupLimitPins() {
+  pinMode(HOME_LIMIT_PIN, INPUT_PULLUP);
+  pinMode(FAR_LIMIT_PIN, INPUT_PULLUP);
+}
+
+void setupMotorPins() {
+  pinMode(SPINDLE_DIR_PIN, OUTPUT);
+  pinMode(LEADSCREW_DIR_PIN, OUTPUT);
+  pinMode(SPINDLE_EN_PIN, OUTPUT);
+  pinMode(LEADSCREW_EN_PIN, OUTPUT);
+}
+
+void enableSteppers() {
+  digitalWrite(SPINDLE_EN_PIN, LOW);
+  digitalWrite(LEADSCREW_EN_PIN, LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  logPins();
+  setupMotorPins();
+  setupJogPins();
+  setupLimitPins();
+
+
+  // enable the steppers (active: LOW)
+  enableSteppers();
+
+  delay(100);  // let the drivers wake up
+  logPins();
+  ledcSetup(SPINDLE_CH,    1, 10);
+  ledcSetup(LEADSCREW_CH,  1, 10);
+  ledcAttachPin(SPINDLE_STEP_PIN, SPINDLE_CH);
+  ledcAttachPin(LEADSCREW_STEP_PIN, LEADSCREW_CH);
+
+  logPins();
+  if (farLimitHit()) {
+    Serial.println("far limit switch triggered at startup — please clear it before running a job");
+    farLimitTriggered = true;
+  }
+  machineState = IDLE;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) delay(200);
+  MDNS.begin(MDNS_NAME);
+  Serial.println(WiFi.localIP());
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+}
+
+void loop() {
+  handleJogSwitches();
+  //updateHoming();
+  updateJob();
+  //broadcastStatus();
+}
